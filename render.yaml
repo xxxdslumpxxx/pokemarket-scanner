@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: pokemarket-scanner
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8765"
