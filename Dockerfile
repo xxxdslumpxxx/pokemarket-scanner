@@ -8,6 +8,11 @@ ENV OMP_NUM_THREADS=1 \
     ORT_LOGGING_LEVEL=3 \
     PYTHONUNBUFFERED=1
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
@@ -16,7 +21,6 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     pydantic \
     pillow \
-    opencv-python-headless \
     rapidocr-onnxruntime
 
 COPY backend ./backend
