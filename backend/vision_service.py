@@ -87,17 +87,22 @@ class LocalPokemonOCR:
         cv2.putText(img, "Pikachu 25/198", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
         self._run(img)
 
-    def _run_tesseract(self, img: np.ndarray) -> list[Block]:
+    def _run_tesseract(self, img: np.ndarray, binarize: bool = False) -> list[Block]:
         import pytesseract
         from PIL import Image
 
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        if binarize:
+            # Se lo sfondo è scuro (testo chiaro), inverti per Tesseract (testo nero su fondo bianco)
+            if float(np.mean(gray)) < 120:
+                gray = 255 - gray
+            _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         pil_img = Image.fromarray(gray)
         data = pytesseract.image_to_data(
             pil_img,
-            lang="eng+ita",
+            lang="eng",
             config="--oem 1 --psm 6",
             output_type=pytesseract.Output.DICT,
         )
@@ -126,9 +131,9 @@ class LocalPokemonOCR:
             blocks.append(Block(((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h, (y2 - y1) / h, text, score))
         return blocks
 
-    def _run(self, img: np.ndarray) -> list[Block]:
+    def _run(self, img: np.ndarray, binarize: bool = False) -> list[Block]:
         if self._use_tesseract():
-            return self._run_tesseract(img)
+            return self._run_tesseract(img, binarize=binarize)
         h, w = img.shape[:2]
         with self._lock:
             engine = self._get_engine()
@@ -160,6 +165,7 @@ class LocalPokemonOCR:
             t = re.sub(r"\b(?:HP|PS|PV|KP)\b", " ", t, flags=re.IGNORECASE)
             t = STAGE_WORDS.sub("", t)
             t = re.sub(r"[^A-Za-zÀ-ÿ0-9'\-&\.\s]", " ", t)
+            t = re.sub(r"\s+[A-Za-z]?\d{2,3}\s*$", "", t)  # rimuove residui HP es. 'w60', '120'
             t = re.sub(r"\s+", " ", t).strip(" .-")
             letters = re.sub(r"[^A-Za-zÀ-ÿ]", "", t)
             if len(letters) < 3 or letters.upper() in IGNORED_CODES:
@@ -224,20 +230,19 @@ class LocalPokemonOCR:
 
         top = card[int(CARD_H * 0.015): int(CARD_H * 0.14), :]
         bottom = card[int(CARD_H * 0.865): CARD_H, :]
-        bottom = cv2.resize(bottom, None, fx=1.45, fy=1.45, interpolation=cv2.INTER_CUBIC)
+        bottom = cv2.resize(bottom, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
 
         top_blocks = self._run(top)
-        bottom_blocks = self._run(bottom)
+        bottom_blocks = self._run(bottom, binarize=True)
         name, conf = self._pick_name(top_blocks)
         info = self._parse_bottom(bottom_blocks)
         used_full = False
 
-        if not name or not info["number"]:
+        if not name:
             used_full = True
             small_card = cv2.resize(card, (380, 530), interpolation=cv2.INTER_AREA)
             full = self._run(small_card)
-            if not name:
-                name, conf = self._pick_name([b for b in full if b.y < 0.2])
+            name, conf = self._pick_name([b for b in full if b.y < 0.2])
             if not info["number"]:
                 info2 = self._parse_bottom([b for b in full if b.y > 0.78])
                 info = {k: info.get(k) or info2.get(k) for k in info}
