@@ -1,0 +1,10 @@
+{
+  "name": "PokéMarket Scanner",
+  "short_name": "PokéMarket",
+  "description": "Scatta una foto a una carta Pokémon e scopri subito i prezzi su Cardmarket.com (minimo, medio, massimo).",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1020",
+  "theme_color": "#0b1020",
+  "orientation": "portrait"
+}
