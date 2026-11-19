@@ -1,0 +1,12 @@
+services:
+  pokemarket-scanner:
+    build: .
+    container_name: pokemarket-scanner
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+      - ./generated_client:/app/generated_client
+    environment:
+      - PORT=8765
