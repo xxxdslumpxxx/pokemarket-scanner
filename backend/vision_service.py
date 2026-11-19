@@ -6,6 +6,7 @@ Riconoscimento carta Pokémon con modello ONNX locale (RapidOCR), stile add-on H
 """
 import asyncio
 import gc
+import os
 import re
 import threading
 import time
@@ -55,7 +56,19 @@ def _fix_digits(token: str) -> str:
 class LocalPokemonOCR:
     def __init__(self) -> None:
         self._engine = None
+        self._backend = os.getenv("OCR_BACKEND", "auto").strip().lower()
         self._lock = threading.Lock()
+
+    def _use_tesseract(self) -> bool:
+        if self._backend == "tesseract":
+            return True
+        if self._backend == "rapidocr":
+            return False
+        try:
+            import rapidocr_onnxruntime  # noqa: F401
+            return False
+        except ImportError:
+            return True
 
     def _get_engine(self):
         if self._engine is None:
@@ -68,11 +81,54 @@ class LocalPokemonOCR:
         return self._engine
 
     def warmup(self) -> None:
+        if self._use_tesseract():
+            return  # Tesseract nativo parte in <100ms, nessun warmup RAM necessario
         img = np.full((96, 320, 3), 255, np.uint8)
         cv2.putText(img, "Pikachu 25/198", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
         self._run(img)
 
+    def _run_tesseract(self, img: np.ndarray) -> list[Block]:
+        import pytesseract
+        from PIL import Image
+
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        pil_img = Image.fromarray(gray)
+        data = pytesseract.image_to_data(
+            pil_img,
+            lang="eng+ita",
+            config="--oem 1 --psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+        # Raggruppa parole per riga (block_num, par_num, line_num) così i nomi composti restano uniti
+        lines: dict[tuple[int, int, int], list[tuple[int, int, int, int, str, float]]] = {}
+        n = len(data["text"])
+        for i in range(n):
+            txt = (data["text"][i] or "").strip()
+            conf = float(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1.0
+            if not txt or conf < 20:
+                continue
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(key, []).append(
+                (data["left"][i], data["top"][i], data["width"][i], data["height"][i], txt, conf / 100.0)
+            )
+
+        blocks: list[Block] = []
+        for words in lines.values():
+            words.sort(key=lambda item: item[0])
+            x1 = min(it[0] for it in words)
+            y1 = min(it[1] for it in words)
+            x2 = max(it[0] + it[2] for it in words)
+            y2 = max(it[1] + it[3] for it in words)
+            text = " ".join(it[4] for it in words)
+            score = sum(it[5] for it in words) / len(words)
+            blocks.append(Block(((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h, (y2 - y1) / h, text, score))
+        return blocks
+
     def _run(self, img: np.ndarray) -> list[Block]:
+        if self._use_tesseract():
+            return self._run_tesseract(img)
         h, w = img.shape[:2]
         with self._lock:
             engine = self._get_engine()
