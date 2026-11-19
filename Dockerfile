@@ -4,11 +4,13 @@ WORKDIR /app
 
 ENV OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    ORT_LOGGING_LEVEL=3 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OCR_BACKEND=tesseract
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-ita \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -21,7 +23,9 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     pydantic \
     pillow \
-    rapidocr-onnxruntime
+    numpy \
+    opencv-python-headless \
+    pytesseract
 
 COPY backend ./backend
 COPY static ./static
