@@ -5,6 +5,7 @@ Riconoscimento carta Pokémon con modello ONNX locale (RapidOCR), stile add-on H
   3. Fallback OCR sulla carta intera solo se serve
 """
 import asyncio
+import gc
 import re
 import threading
 import time
@@ -60,7 +61,10 @@ class LocalPokemonOCR:
         if self._engine is None:
             from rapidocr_onnxruntime import RapidOCR
 
-            self._engine = RapidOCR()
+            try:
+                self._engine = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
+            except TypeError:
+                self._engine = RapidOCR()
         return self._engine
 
     def warmup(self) -> None:
@@ -174,7 +178,8 @@ class LocalPokemonOCR:
 
         if not name or not info["number"]:
             used_full = True
-            full = self._run(card)
+            small_card = cv2.resize(card, (380, 530), interpolation=cv2.INTER_AREA)
+            full = self._run(small_card)
             if not name:
                 name, conf = self._pick_name([b for b in full if b.y < 0.2])
             if not info["number"]:
@@ -183,6 +188,8 @@ class LocalPokemonOCR:
             lang_hint = self._guess_lang(" ".join(b.text for b in full))
         else:
             lang_hint = None
+
+        gc.collect()
 
         if not name:
             raise RuntimeError(
