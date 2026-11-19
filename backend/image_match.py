@@ -11,10 +11,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-CARD_W, CARD_H = 560, 782  # proporzione 63:88 (ottimizzata per OCR rapido)
+CARD_W, CARD_H = 520, 726  # proporzione 63:88 (bassa RAM + OCR veloce)
 
 
-def decode_to_bgr(image_bytes: bytes, max_side: int = 1600) -> np.ndarray:
+def decode_to_bgr(image_bytes: bytes, max_side: int = 960) -> np.ndarray:
     with Image.open(io.BytesIO(image_bytes)) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
         img.thumbnail((max_side, max_side))
