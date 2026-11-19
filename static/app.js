@@ -1,5 +1,50 @@
 (() => {
   const $ = (id) => document.getElementById(id);
+  const DB_NAME = "pokemarket_local_db";
+  const STORE_NAME = "saved_cards";
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(STORE_NAME)) {
+          req.result.createObjectStore(STORE_NAME, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function dbGetAll() {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).getAll();
+      req.onsuccess = () => resolve((req.result || []).sort((a, b) => (b.saved_at || 0) - (a.saved_at || 0)));
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function dbPut(entry) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put(entry);
+      tx.oncomplete = () => resolve(entry);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function dbDelete(id) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).delete(id);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   const state = {
     view: "scan",
     prevTab: "scan",
@@ -226,28 +271,31 @@
     btn.disabled = true;
     try {
       const card = { ...state.result, identification: state.readIdent || state.result.identification };
-      const fd = new FormData();
-      fd.append("payload", JSON.stringify(card));
-      if (state.photoBlob) fd.append("photo", state.photoBlob, "foto.jpg");
-      await apiJson(await fetch("/api/saved", { method: "POST", body: fd }));
+      const entry = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        saved_at: Date.now() / 1000,
+        card,
+        photoBlob: state.photoBlob || null,
+      };
+      await dbPut(entry);
       btn.textContent = "✓ Salvata";
       btn.classList.add("saved");
-      toast("Carta salvata con la tua foto ⭐");
+      toast("Carta salvata sul telefono con la tua foto ⭐");
     } catch (e) {
       btn.disabled = false;
-      toast(e.message, true);
+      toast(e.message || "Errore salvataggio locale", true);
     }
   }
 
   async function deleteCurrent() {
     if (!state.savedId || !confirm("Eliminare questa carta dalle salvate?")) return;
     try {
-      await apiJson(await fetch(`/api/saved/${state.savedId}`, { method: "DELETE" }));
+      await dbDelete(state.savedId);
       toast("Eliminata");
       state.savedId = null;
       show("saved");
     } catch (e) {
-      toast(e.message, true);
+      toast(e.message || "Errore eliminazione", true);
     }
   }
 
@@ -276,11 +324,11 @@
     }
   }
 
-  // ---------- salvate ----------
+  // ---------- salvate (IndexedDB locale sul telefono) ----------
   async function loadSaved() {
     const list = $("saved-list");
     try {
-      const items = await apiJson(await fetch("/api/saved"));
+      const items = await dbGetAll();
       list.innerHTML = "";
       let total = 0;
       items.forEach((it) => {
@@ -290,7 +338,8 @@
         const row = document.createElement("div");
         row.className = "saved-item";
         const ph = document.createElement("img");
-        if (it.photo_url) ph.src = it.photo_url;
+        const localPhotoUrl = it.photoBlob ? URL.createObjectURL(it.photoBlob) : null;
+        if (localPhotoUrl) ph.src = localPhotoUrl;
         const ci = document.createElement("img");
         if (c.image_url) ci.src = c.image_url.replace("/high.", "/low.");
         const info = document.createElement("div");
@@ -308,8 +357,8 @@
         row.append(ph, ci, info, p);
         row.addEventListener("click", () => {
           state.savedId = it.id;
-          state.photoBlob = null;
-          state.photoUrl = it.photo_url;
+          state.photoBlob = it.photoBlob || null;
+          state.photoUrl = it.photoBlob ? URL.createObjectURL(it.photoBlob) : null;
           state.readIdent = c.identification || null;
           renderResult(c);
         });
