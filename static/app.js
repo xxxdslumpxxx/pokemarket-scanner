@@ -93,7 +93,7 @@
   }
 
   // ---------- immagini ----------
-  function resizeImage(file, maxDim = 1280) {
+  function resizeImage(file, maxDim = 960) {
     return new Promise((resolve, reject) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
@@ -107,7 +107,7 @@
         c.width = w;
         c.height = h;
         c.getContext("2d").drawImage(img, 0, 0, w, h);
-        c.toBlob((b) => (b ? resolve(b) : reject(new Error("Foto non valida"))), "image/jpeg", 0.85);
+        c.toBlob((b) => (b ? resolve(b) : reject(new Error("Foto non valida"))), "image/jpeg", 0.82);
       };
       img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Foto non valida")); };
       img.src = url;
