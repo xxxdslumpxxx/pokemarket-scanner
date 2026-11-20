@@ -414,7 +414,7 @@ class CardmarketService:
             types=det.get("types") or [],
             artist=det.get("illustrator"),
             image_url=f"{img}/high.webp" if img else None,
-            cardmarket_url=reverse_raw.get("url") or build_cardmarket_search_url(name),
+            cardmarket_url=reverse_raw.get("url") or build_cardmarket_search_url(name, lid, set_obj.get("name")),
             prices=self._merge_prices(cm, listings),
             listings=listings[:25],
             data_source="Cardmarket (reverse-api-engineer)" if listings else "Cardmarket (via TCGdex)",
