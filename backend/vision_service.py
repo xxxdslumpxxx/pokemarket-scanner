@@ -43,12 +43,12 @@ Osserva attentamente questa foto di una carta Pokémon (anche se è in italiano 
 Rispondi SOLO con JSON puro, senza markdown o testo extra."""
 
 
-def _compress_for_vision(image_bytes: bytes, max_dim: int = 960) -> str:
+def _compress_for_vision(image_bytes: bytes, max_dim: int = 768) -> str:
     with Image.open(io.BytesIO(image_bytes)) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
         img.thumbnail((max_dim, max_dim))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=82)
+        img.save(buf, format="JPEG", quality=78)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -100,7 +100,7 @@ class VisionCardRecognizer:
 
         t0 = time.perf_counter()
         b64_img = await asyncio.to_thread(_compress_for_vision, image_bytes)
-        card_img = await asyncio.to_thread(lambda b: prepare_card(b)[0], image_bytes)
+        card_img = None  # Non serve OpenCV Canny su Render 0.1 vCPU: Gemini legge direttamente la carta!
 
         client = self._get_http()
         models_to_try = [self.gemini_model]
@@ -117,6 +117,12 @@ class VisionCardRecognizer:
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent?key={self.gemini_api_key}"
             )
+            gen_cfg: dict[str, Any] = {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            }
+            if "gemini-3" in model_name:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
             payload = {
                 "contents": [
                     {
@@ -127,10 +133,7 @@ class VisionCardRecognizer:
                         ],
                     }
                 ],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "responseMimeType": "application/json",
-                },
+                "generationConfig": gen_cfg,
             }
             try:
                 resp = await client.post(url, json=payload)
