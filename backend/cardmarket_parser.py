@@ -144,15 +144,37 @@ def extract_cardmarket_from_har(har_data: dict) -> dict:
     return results
 
 
+CARDMARKET_LANGUAGE_IDS: dict[str, int] = {
+    "english": 1, "en": 1, "inglese": 1,
+    "french": 2, "français": 2, "fr": 2, "francese": 2,
+    "german": 3, "deutsch": 3, "de": 3, "tedesco": 3,
+    "spanish": 4, "español": 4, "es": 4, "spagnolo": 4,
+    "italian": 5, "italiano": 5, "it": 5,
+    "japanese": 7, "jp": 7, "giapponese": 7,
+    "portuguese": 8, "português": 8, "pt": 8, "portoghese": 8,
+}
+
+
 def build_cardmarket_search_url(
     name: str,
     card_number: Optional[str] = None,
     set_name: Optional[str] = None,
+    language: Optional[str] = None,
+    min_condition: int = 2,
 ) -> str:
-    """Costruisce l'URL di ricerca ufficiale su Cardmarket filtrato sulle carte singole Pokémon."""
+    """
+    Costruisce l'URL di ricerca ufficiale su Cardmarket filtrato sulle carte singole Pokémon,
+    pre-impostato sulla lingua rilevata e condizione minima Near Mint (minCondition=2).
+    """
     base_url = "https://www.cardmarket.com/en/Pokemon/Products/Singles"
     num_only = card_number.split("/")[0].strip() if card_number else None
-    # Nome + numero carta (senza /totale) è la query più precisa su Cardmarket Singles
     parts = [p.strip() for p in (name, num_only) if p and p.strip()]
-    query = " ".join(parts)
-    return f"{base_url}?searchString={urllib.parse.quote_plus(query)}"
+    params: dict[str, Any] = {
+        "searchString": " ".join(parts),
+        "minCondition": min_condition,
+    }
+    if language:
+        lang_id = CARDMARKET_LANGUAGE_IDS.get(language.strip().lower())
+        if lang_id:
+            params["language"] = lang_id
+    return f"{base_url}?{urllib.parse.urlencode(params)}"
