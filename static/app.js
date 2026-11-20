@@ -396,6 +396,9 @@
 
   fetch("/api/status")
     .then((r) => r.json())
-    .then((d) => { $("source-badge").textContent = "ONNX pronto"; })
+    .then((d) => {
+      const p = d.vision_provider || "";
+      $("source-badge").textContent = p.includes("Gemini") ? "Gemini Vision" : "Pronto";
+    })
     .catch(() => { const b = $("source-badge"); b.textContent = "Offline"; b.classList.add("warn"); });
 })();
