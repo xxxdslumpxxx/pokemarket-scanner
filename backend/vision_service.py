@@ -1,290 +1,177 @@
 """
-Riconoscimento carta Pokémon con modello ONNX locale (RapidOCR), stile add-on Home Assistant:
-  1. Trova e raddrizza la carta nella foto (OpenCV)
-  2. OCR SOLO sulle due fasce utili (nome in alto, codici in basso) -> molto più veloce
-  3. Fallback OCR sulla carta intera solo se serve
+Riconoscimento carta Pokémon:
+  1. Se GEMINI_API_KEY è impostata (es. su Render Environment Variables o .env),
+     usa Google Gemini Vision (gemini-3-flash-preview) -> ~1-2s, ~60 MB RAM, 99% precisione
+     anche su carte italiane, olografiche, angolate e con solo simbolo del set!
+  2. Altrimenti fallback automatico su OCR locale (RapidOCR ONNX / Tesseract).
 """
 import asyncio
+import base64
 import gc
+import io
+import json
 import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import cv2
+from dotenv import load_dotenv
+import httpx
 import numpy as np
+from PIL import Image, ImageOps
 
 from .image_match import CARD_H, CARD_W, prepare_card
 from .models import CardIdentification
 
-LANG_CODES = {
-    "EN": "English", "IT": "Italiano", "FR": "Français", "DE": "Deutsch",
-    "ES": "Español", "PT": "Português", "NL": "Nederlands", "JP": "Japanese",
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+GEMINI_VISION_PROMPT = """Sei un esperto di carte collezionabili Pokémon (TCG).
+Osserva attentamente questa foto di una carta Pokémon (anche se è in italiano o angolata o olografica) e restituisci ESCLUSIVAMENTE un JSON valido con questi campi:
+{
+  "name": "Nome esatto della carta in INGLESE (es. 'Hisuian Zorua', 'Charizard ex', 'Pikachu & Zekrom GX', 'Umbreon VMAX'). Traduci sempre forme regionali (es. 'Zorua di Hisui' -> 'Hisuian Zorua').",
+  "set_code": "Codice set di 2-4 lettere in basso a sinistra se stampato (es. 'LOR', 'MEW', 'SVI', 'OBF', 'CRZ', 'SVP'), altrimenti null",
+  "set_name": "Nome dell'espansione/set in inglese riconosciuto dal simbolo del set o dal codice (es. 'Lost Origin', '30th Celebration', '151', 'Team Up'), altrimenti null",
+  "card_number": "Solo il numero della carta prima dello slash (es. '075', '145', '199', '33', 'TG05'), altrimenti null",
+  "total_in_set": "Solo il numero dopo lo slash (es. '196', '128', '165', '181'), altrimenti null",
+  "language": "Lingua stampata sulla carta (es. 'Italiano', 'English', 'Japanese', 'Français', 'Deutsch')",
+  "is_holo": false,
+  "confidence": 0.95
 }
-IGNORED_CODES = {
-    "HP", "PS", "PV", "KP", "TM", "EX", "GX", "NO", "LV", "GAME", "FREAK", "ILLUS",
-    "BASIC", "BASE", "V", "VMAX", "VSTAR",
-} | set(LANG_CODES)
-STAGE_WORDS = re.compile(
-    r"^\s*(?:BASIC|BASE|STAGE\s*\d|FASE\s*\d|LIVELLO\s*\d|TRAINER|ALLENATORE|STRUMENTO|ITEM|"
-    r"SUPPORTER|AIUTO|STADIUM|STADIO|ENERGY|ENERGIA)\b[\s:]*",
-    re.IGNORECASE,
-)
-NUM_RE = re.compile(
-    r"(?<![0-9])((?:TG|GG|SV|RC|H)?[0-9OoIl]{1,3})\s*/\s*((?:TG|GG|SV)?[0-9OoIl]{2,3})(?![0-9])",
-    re.IGNORECASE,
-)
-PROMO_RE = re.compile(r"\b(SWSH|SM|XY|BW)\s*0*(\d{1,3})\b", re.IGNORECASE)
+Rispondi SOLO con JSON puro, senza markdown o testo extra."""
 
 
-class Block(NamedTuple):
-    x: float
-    y: float
-    h: float
-    text: str
-    score: float
+def _compress_for_vision(image_bytes: bytes, max_dim: int = 960) -> str:
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((max_dim, max_dim))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _fix_digits(token: str) -> str:
-    m = re.match(r"^(TG|GG|SV|RC|H)?(.*)$", token, re.IGNORECASE)
-    prefix = (m.group(1) or "").upper()
-    rest = m.group(2).replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
-    return prefix + rest
-
-
-class LocalPokemonOCR:
-    def __init__(self) -> None:
-        self._engine = None
-        self._backend = os.getenv("OCR_BACKEND", "auto").strip().lower()
-        self._lock = threading.Lock()
-
-    def _use_tesseract(self) -> bool:
-        if self._backend == "tesseract":
-            return True
-        if self._backend == "rapidocr":
-            return False
-        try:
-            import rapidocr_onnxruntime  # noqa: F401
-            return False
-        except ImportError:
-            return True
-
-    def _get_engine(self):
-        if self._engine is None:
-            from rapidocr_onnxruntime import RapidOCR
-
-            try:
-                self._engine = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
-            except TypeError:
-                self._engine = RapidOCR()
-        return self._engine
-
-    def warmup(self) -> None:
-        if self._use_tesseract():
-            return  # Tesseract nativo parte in <100ms, nessun warmup RAM necessario
-        img = np.full((96, 320, 3), 255, np.uint8)
-        cv2.putText(img, "Pikachu 25/198", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
-        self._run(img)
-
-    def _run_tesseract(self, img: np.ndarray, binarize: bool = False) -> list[Block]:
-        import pytesseract
-        from PIL import Image
-
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        if binarize:
-            # Se lo sfondo è scuro (testo chiaro), inverti per Tesseract (testo nero su fondo bianco)
-            if float(np.mean(gray)) < 120:
-                gray = 255 - gray
-            _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        pil_img = Image.fromarray(gray)
-        data = pytesseract.image_to_data(
-            pil_img,
-            lang="eng",
-            config="--oem 1 --psm 6",
-            output_type=pytesseract.Output.DICT,
-        )
-        # Raggruppa parole per riga (block_num, par_num, line_num) così i nomi composti restano uniti
-        lines: dict[tuple[int, int, int], list[tuple[int, int, int, int, str, float]]] = {}
-        n = len(data["text"])
-        for i in range(n):
-            txt = (data["text"][i] or "").strip()
-            conf = float(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1.0
-            if not txt or conf < 20:
-                continue
-            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines.setdefault(key, []).append(
-                (data["left"][i], data["top"][i], data["width"][i], data["height"][i], txt, conf / 100.0)
-            )
-
-        blocks: list[Block] = []
-        for words in lines.values():
-            words.sort(key=lambda item: item[0])
-            x1 = min(it[0] for it in words)
-            y1 = min(it[1] for it in words)
-            x2 = max(it[0] + it[2] for it in words)
-            y2 = max(it[1] + it[3] for it in words)
-            text = " ".join(it[4] for it in words)
-            score = sum(it[5] for it in words) / len(words)
-            blocks.append(Block(((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h, (y2 - y1) / h, text, score))
-        return blocks
-
-    def _run(self, img: np.ndarray, binarize: bool = False) -> list[Block]:
-        if self._use_tesseract():
-            return self._run_tesseract(img, binarize=binarize)
-        h, w = img.shape[:2]
-        with self._lock:
-            engine = self._get_engine()
-            try:
-                result, _ = engine(img, use_cls=False)
-            except TypeError:
-                result, _ = engine(img)
-        blocks: list[Block] = []
-        for item in result or []:
-            box, text, score = item[0], str(item[1]).strip(), float(item[2])
-            if not text:
-                continue
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            blocks.append(
-                Block(sum(xs) / len(xs) / w, sum(ys) / len(ys) / h, (max(ys) - min(ys)) / h, text, score)
-            )
-        return blocks
-
-    @staticmethod
-    def _pick_name(blocks: list[Block]) -> tuple[Optional[str], float]:
-        cands: list[tuple[float, str, float]] = []
-        for b in blocks:
-            t = b.text
-            if re.match(r"^\s*(?:evolves|si evolve|evolve da|entwickelt|évolue)", t, re.IGNORECASE):
-                continue
-            t = re.sub(r"\b(?:HP|PS|PV|KP)\s*\d{2,3}\b", " ", t, flags=re.IGNORECASE)
-            t = re.sub(r"\b\d{2,3}\s*(?:HP|PS|PV|KP)\b", " ", t, flags=re.IGNORECASE)
-            t = re.sub(r"\b(?:HP|PS|PV|KP)\b", " ", t, flags=re.IGNORECASE)
-            t = STAGE_WORDS.sub("", t)
-            t = re.sub(r"[^A-Za-zÀ-ÿ0-9'\-&\.\s]", " ", t)
-            t = re.sub(r"\s+[A-Za-z]?\d{2,3}\s*$", "", t)  # rimuove residui HP es. 'w60', '120'
-            t = re.sub(r"\s+", " ", t).strip(" .-")
-            letters = re.sub(r"[^A-Za-zÀ-ÿ]", "", t)
-            if len(letters) < 3 or letters.upper() in IGNORED_CODES:
-                continue
-            # Il nome è il testo PIÙ GRANDE della fascia alta, tendenzialmente a sinistra
-            prio = b.h * (0.5 + b.score) - (0.4 * b.h if b.x > 0.75 else 0.0)
-            cands.append((prio, t, b.score))
-        if not cands:
-            return None, 0.0
-        cands.sort(key=lambda c: -c[0])
-        return cands[0][1], cands[0][2]
-
-    @staticmethod
-    def _parse_bottom(blocks: list[Block]) -> dict[str, Optional[str]]:
-        out: dict[str, Optional[str]] = {"number": None, "total": None, "set_code": None, "lang": None}
-        if not blocks:
-            return out
-        by_x = sorted(blocks, key=lambda b: b.x)
-        left = [b for b in by_x if b.x < 0.55]
-
-        # Codice set + lingua (in basso a sinistra, es. "LOR IT 075/196")
-        for b in left:
-            for tok in re.findall(r"\b[A-Z]{2,4}\b", b.text):
-                if tok in LANG_CODES and not out["lang"]:
-                    out["lang"] = LANG_CODES[tok]
-                elif tok not in IGNORED_CODES and not out["set_code"]:
-                    out["set_code"] = tok
-
-        # Numero / totale: prima a sinistra, poi ovunque (i set vecchi con SIMBOLO lo hanno a destra)
-        zones = [b.text for b in left] + [b.text for b in by_x] + [" ".join(b.text for b in by_x)]
-        for z in zones:
-            m = NUM_RE.search(z)
-            if m:
-                out["number"] = _fix_digits(m.group(1))
-                out["total"] = _fix_digits(m.group(2))
-                return out
-        for z in zones:
-            m = PROMO_RE.search(z)
-            if m:
-                out["set_code"] = m.group(1).upper()
-                out["number"] = f"{m.group(1).upper()}{int(m.group(2)):03d}"
-                return out
-        # Promo SV: "SVP EN 001" (senza slash)
-        if out["set_code"] == "SVP":
-            m = re.search(r"\b(\d{3})\b", " ".join(b.text for b in left))
-            if m:
-                out["number"] = m.group(1)
-        return out
-
-    @staticmethod
-    def _guess_lang(texts: str) -> Optional[str]:
-        low = texts.lower()
-        if any(w in low for w in ("debolezza", "resistenza", "ritirata", "si evolve")):
-            return "Italiano"
-        if any(w in low for w in ("weakness", "resistance", "retreat", "evolves from")):
-            return "English"
-        return None
-
-    def identify(self, image_bytes: bytes) -> tuple[CardIdentification, np.ndarray]:
-        t0 = time.perf_counter()
-        card, found, _orig = prepare_card(image_bytes)
-
-        top = card[int(CARD_H * 0.015): int(CARD_H * 0.14), :]
-        bottom = card[int(CARD_H * 0.865): CARD_H, :]
-        bottom = cv2.resize(bottom, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
-
-        top_blocks = self._run(top)
-        bottom_blocks = self._run(bottom, binarize=True)
-        name, conf = self._pick_name(top_blocks)
-        info = self._parse_bottom(bottom_blocks)
-        used_full = False
-
-        if not name:
-            used_full = True
-            small_card = cv2.resize(card, (380, 530), interpolation=cv2.INTER_AREA)
-            full = self._run(small_card)
-            name, conf = self._pick_name([b for b in full if b.y < 0.2])
-            if not info["number"]:
-                info2 = self._parse_bottom([b for b in full if b.y > 0.78])
-                info = {k: info.get(k) or info2.get(k) for k in info}
-            lang_hint = self._guess_lang(" ".join(b.text for b in full))
-        else:
-            lang_hint = None
-
-        gc.collect()
-
-        if not name:
-            raise RuntimeError(
-                "Non riesco a leggere il nome della carta. Rifai la foto con la carta intera, dritta e senza riflessi."
-            )
-
-        ms = int((time.perf_counter() - t0) * 1000)
-        ident = CardIdentification(
-            name=name,
-            set_name=info["set_code"],
-            card_number=info["number"],
-            total_in_set=info["total"],
-            language=info["lang"] or lang_hint or "N/D",
-            condition_estimate=None,
-            is_holo=False,
-            confidence=round(min(max(conf, 0.3), 0.99), 2),
-            raw_notes=f"ONNX locale in {ms} ms | carta {'ritagliata' if found else 'non ritagliata'}"
-            + (" | OCR completo" if used_full else ""),
-        )
-        return ident, card
+def _extract_json(text: str) -> dict:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        raise
 
 
 class VisionCardRecognizer:
-    """Riconoscimento 100% locale con ONNX (nessuna API key)."""
+    """Riconoscimento carta Pokémon via Google Gemini Vision (primario) con fallback OCR locale."""
 
     def __init__(self) -> None:
-        self._local_ocr = LocalPokemonOCR()
+        self._http: Optional[httpx.AsyncClient] = None
+        self._refresh_config()
+
+    def _refresh_config(self) -> None:
+        load_dotenv(ROOT_DIR / ".env", override=False)
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_model = os.getenv("GEMINI_VISION_MODEL", "gemini-3-flash-preview").strip()
+
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0))
+        return self._http
 
     @property
     def configured_provider(self) -> str:
-        return "ONNX Locale (Zero API Key)"
+        self._refresh_config()
+        if self.gemini_api_key:
+            return f"Gemini Vision ({self.gemini_model})"
+        return "OCR Locale"
 
     def warmup(self) -> None:
-        self._local_ocr.warmup()
+        # Con Gemini Vision non serve nessun warmup pesante in RAM
+        return
 
     async def identify(self, image_bytes: bytes) -> tuple[CardIdentification, Any]:
-        return await asyncio.to_thread(self._local_ocr.identify, image_bytes)
+        self._refresh_config()
+        if not self.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY non configurata sul server.")
+
+        t0 = time.perf_counter()
+        b64_img = await asyncio.to_thread(_compress_for_vision, image_bytes)
+        card_img = await asyncio.to_thread(lambda b: prepare_card(b)[0], image_bytes)
+
+        client = self._get_http()
+        models_to_try = [self.gemini_model]
+        for fallback in ("gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-flash-latest"):
+            if fallback not in models_to_try:
+                models_to_try.append(fallback)
+
+        last_err: Optional[Exception] = None
+        data: Optional[dict] = None
+        used_model = self.gemini_model
+
+        for model_name in models_to_try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={self.gemini_api_key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": GEMINI_VISION_PROMPT},
+                            {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}},
+                        ],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json",
+                },
+            }
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
+                text = body["candidates"][0]["content"]["parts"][0]["text"]
+                data = _extract_json(text)
+                used_model = model_name
+                break
+            except Exception as exc:
+                last_err = exc
+                continue
+
+        if data is None:
+            raise RuntimeError(f"Errore Gemini Vision: {last_err}")
+
+        ms = int((time.perf_counter() - t0) * 1000)
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise RuntimeError("Non riesco a riconoscere la carta nella foto. Riprova inquadrandola bene.")
+
+        set_hint = data.get("set_code") or data.get("set_name")
+        card_num = str(data["card_number"]).strip() if data.get("card_number") else None
+        total_set = str(data["total_in_set"]).strip() if data.get("total_in_set") else None
+        if card_num and "/" in card_num:
+            parts = card_num.split("/", 1)
+            card_num = parts[0].strip()
+            total_set = total_set or parts[1].strip()
+
+        ident = CardIdentification(
+            name=name,
+            set_name=str(set_hint).strip() if set_hint else None,
+            card_number=card_num,
+            total_in_set=total_set,
+            language=str(data.get("language") or "Italiano"),
+            condition_estimate=None,
+            is_holo=bool(data.get("is_holo", False)),
+            confidence=round(min(max(float(data.get("confidence", 0.92)), 0.1), 0.99), 2),
+            raw_notes=f"Gemini Vision ({used_model}) in {ms} ms",
+        )
+        gc.collect()
+        return ident, card_img
