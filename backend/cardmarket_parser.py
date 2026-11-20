@@ -149,8 +149,10 @@ def build_cardmarket_search_url(
     card_number: Optional[str] = None,
     set_name: Optional[str] = None,
 ) -> str:
-    """Costruisce l'URL di ricerca ufficiale su Cardmarket per Pokémon."""
-    base_url = "https://www.cardmarket.com/en/Pokemon/Products/Search"
-    parts = [p.strip() for p in (name, card_number, set_name) if p and p.strip()]
+    """Costruisce l'URL di ricerca ufficiale su Cardmarket filtrato sulle carte singole Pokémon."""
+    base_url = "https://www.cardmarket.com/en/Pokemon/Products/Singles"
+    num_only = card_number.split("/")[0].strip() if card_number else None
+    # Nome + numero carta (senza /totale) è la query più precisa su Cardmarket Singles
+    parts = [p.strip() for p in (name, num_only) if p and p.strip()]
     query = " ".join(parts)
     return f"{base_url}?searchString={urllib.parse.quote_plus(query)}"
