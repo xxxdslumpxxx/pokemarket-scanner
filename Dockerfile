@@ -3,13 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
-    OCR_BACKEND=rapidocr \
-    PORT=7860
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    PORT=8765
 
 RUN pip install --no-cache-dir \
     fastapi \
@@ -19,7 +13,8 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     pydantic \
     pillow \
-    rapidocr-onnxruntime
+    numpy \
+    opencv-python-headless
 
 COPY backend ./backend
 COPY static ./static
@@ -27,6 +22,6 @@ COPY generated_client ./generated_client
 
 RUN mkdir -p /app/data/saved/photos && chmod -R 777 /app/data
 
-EXPOSE 7860
+EXPOSE 8765
 
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-7860}"]
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8765} --workers 1"]
